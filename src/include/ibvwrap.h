@@ -24,6 +24,15 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#ifdef PII_ENABLED
+#include "pii_runtime.h"
+
+/* Defined in ibvwrap.cc — single process-wide definition avoids the
+ * static-inline-per-TU bug where each translation unit gets its own
+ * once_flag / daemon socket / thread_local session. */
+pii_session_rt* pii_get_thread_session();
+#endif // PII_ENABLED
+
 typedef enum ibv_return_enum
 {
     IBV_SUCCESS = 0,                   //!< The operation was successful
@@ -57,7 +66,17 @@ ncclResult_t wrap_ibv_destroy_comp_channel(struct ibv_comp_channel *channel);
 ncclResult_t wrap_ibv_create_cq(struct ibv_cq **ret, struct ibv_context *context, int cqe, void *cq_context, struct ibv_comp_channel *channel, int comp_vector);
 ncclResult_t wrap_ibv_destroy_cq(struct ibv_cq *cq);
 static inline ncclResult_t wrap_ibv_poll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc, int* num_done) {
+#ifdef PII_ENABLED
+  pii_session_rt* session = pii_get_thread_session();
+  int done;
+  if (session != nullptr) {
+    done = pii_ibv_poll_cq(cq, num_entries, wc);
+  } else {
+    done = cq->context->ops.poll_cq(cq, num_entries, wc);
+  }
+#else
   int done = cq->context->ops.poll_cq(cq, num_entries, wc); /*returns the number of wcs or 0 on success, a negative number otherwise*/
+#endif
   if (done < 0) {
     WARN("Call to ibv_poll_cq() returned %d", done);
     return ncclSystemError;
@@ -72,7 +91,17 @@ ncclResult_t wrap_ibv_query_ece(struct ibv_qp *qp, struct ibv_ece *ece, int* sup
 ncclResult_t wrap_ibv_set_ece(struct ibv_qp *qp, struct ibv_ece *ece, int* supported);
 
 static inline ncclResult_t wrap_ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_send_wr **bad_wr) {
+#ifdef PII_ENABLED
+  pii_session_rt* session = pii_get_thread_session();
+  int ret;
+  if (session != nullptr) {
+    ret = pii_ibv_post_send(session, qp, wr, bad_wr);
+  } else {
+    ret = qp->context->ops.post_send(qp, wr, bad_wr);
+  }
+#else
   int ret = qp->context->ops.post_send(qp, wr, bad_wr); /*returns 0 on success, or the value of errno on failure (which indicates the failure reason)*/
+#endif
   if (ret != IBV_SUCCESS) {
     WARN("ibv_post_send() failed with error %s, Bad WR %p, First WR %p", strerror(ret), wr, *bad_wr);
     return ncclSystemError;

@@ -15,6 +15,59 @@
 #endif
 #include "ibvsymbols.h"
 
+#ifdef PII_ENABLED
+#include <cstdlib>
+#include <mutex>
+
+/* Process-global daemon connection — exactly one copy in the entire process.
+ * This was previously static inline in the header, which created per-TU
+ * copies of sock/flag, causing multiple connect_to_daemon() calls and
+ * PII_MGMT_ERR_DUPLICATE_PID rejections from the daemon. */
+static int pii_daemon_sock = -1;
+static std::once_flag pii_daemon_flag;
+
+static int pii_ensure_daemon_connected() {
+  std::call_once(pii_daemon_flag, []() {
+    pii_daemon_sock = connect_to_daemon();
+    if (pii_daemon_sock < 0)
+      WARN("pii: cannot connect to daemon");
+  });
+  return pii_daemon_sock;
+}
+
+/* RAII wrapper: one session per thread, created on first use and destroyed
+ * on thread exit. */
+struct PiiThreadSession {
+  pii_session_rt* session = nullptr;
+
+  PiiThreadSession() {
+    int sock = pii_ensure_daemon_connected();
+    if (sock < 0) return;
+    const char* gpu_bdf = getenv("PII_GPU_BDF");
+    const char* nic_bdf = getenv("PII_NIC_BDF");
+    if (!gpu_bdf) gpu_bdf = "99:00.0";
+    if (!nic_bdf) nic_bdf = "ab:00.0";
+    session = create_session(sock, gpu_bdf, nic_bdf);
+    if (session)
+      INFO(NCCL_NET, "pii: thread session ready (GPU=%s NIC=%s)", gpu_bdf, nic_bdf);
+    else
+      WARN("pii: create_session failed (GPU=%s NIC=%s)", gpu_bdf, nic_bdf);
+  }
+
+  ~PiiThreadSession() {
+    if (session) {
+      destroy_session(session);
+      session = nullptr;
+    }
+  }
+};
+
+pii_session_rt* pii_get_thread_session() {
+  thread_local PiiThreadSession holder;
+  return holder.session;
+}
+#endif // PII_ENABLED
+
 static pthread_once_t initOnceControl = PTHREAD_ONCE_INIT;
 static ncclResult_t initResult;
 struct ncclIbvSymbols ibvSymbols;

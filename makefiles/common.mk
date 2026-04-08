@@ -149,7 +149,8 @@ CXXFLAGS += -DPROFAPI
 endif
 
 ifneq ($(RDMA_CORE), 0)
-CXXFLAGS += -DNCCL_BUILD_RDMA_CORE=1 -libverbs
+CXXFLAGS += -DNCCL_BUILD_RDMA_CORE=1
+LDFLAGS  += -libverbs
 endif
 
 ifneq ($(MLX5DV), 0)
@@ -162,4 +163,20 @@ endif
 
 ifneq ($(MAX_EXT_NET_PLUGINS), 0)
 CXXFLAGS += -DNCCL_NET_MAX_PLUGINS=$(MAX_EXT_NET_PLUGINS)
+endif
+
+PII ?= 0
+PII_HOME ?= $(HOME)/yuyuan/Github/pii
+
+ifneq ($(PII), 0)
+# pii_runtime.h includes system <infiniband/verbs.h>; NCCL must use the same
+# header (not its internal ibvcore.h) to avoid type redefinition conflicts.
+# RDMA_CORE flag is set here directly because the ifneq(RDMA_CORE) block above
+# is already evaluated at parse time before this block runs.
+# -libverbs goes in LDFLAGS (after objects) so the linker sees unresolved
+# ibverbs symbols before scanning libibverbs.
+CXXFLAGS += -DNCCL_BUILD_RDMA_CORE=1 -DPII_ENABLED -I$(PII_HOME)/build/_deps/spdlog-src/include -I$(PII_HOME)/include
+LDFLAGS  += -libverbs \
+            -L$(PII_HOME)/build/src/runtime -lpii_runtime \
+            -Wl,-rpath,$(PII_HOME)/build/src/runtime
 endif
