@@ -96,6 +96,7 @@ ncclResult_t ncclAllGather(const void* sendbuff, void* recvbuff, size_t sendcoun
 
 /* ──────────────── PII: AllReduce wire-inflation knobs ──────────────── */
 NCCL_PARAM(ARInflateFactor,   "AR_INFLATE_FACTOR",   1);
+NCCL_PARAM(ARInflateBytes,    "AR_INFLATE_BYTES",    0);            // static mode: fixed dummy bytes per AR (0 = use factor mode)
 NCCL_PARAM(ARInflateMaxBytes, "AR_INFLATE_MAX_BYTES", 256L*1024*1024);
 
 #ifdef PII_ENABLED
@@ -153,13 +154,18 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
   NCCLCHECK(ncclEnqueueCheck(&info));
 
 #ifdef PII_ENABLED
-  /* 2. Optional dummy AllReduce: inflates wire bytes by (factor-1)×.
-   *    Same stream → serializes after the real op → blocks the caller's
-   *    stream exactly like real comm.
-   *    Errors here are SWALLOWED — the real AR already succeeded. */
+  /* 2. Optional dummy AllReduce.
+   *    Two modes:
+   *      Static: NCCL_AR_INFLATE_BYTES=N  → always send N bytes per AR call
+   *      Factor: NCCL_AR_INFLATE_FACTOR=F → send (F-1)×original bytes
+   *    Static takes precedence when > 0.
+   *    Same stream → serializes → blocks the caller like real comm.
+   *    Errors are SWALLOWED — the real AR already succeeded. */
   do {
+    const int64_t staticBytes = ncclParamARInflateBytes();
     const int factor = ncclParamARInflateFactor();
-    if (factor <= 1 || comm == nullptr || count == 0 ||
+    if (comm == nullptr || count == 0 ||
+        (staticBytes <= 0 && factor <= 1) ||
         piiDummyInitFailed.load(std::memory_order_relaxed))
       break;
 
@@ -178,16 +184,22 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
     if (piiDummyBuf == nullptr) break;
 
     const size_t typeSize = ncclTypeSize(datatype);
-    size_t dummyCount = count * (size_t)(factor - 1);
-    size_t dummyBytes = dummyCount * typeSize;
+    size_t dummyBytes;
+    if (staticBytes > 0) {
+      /* Static mode: fixed dummy size, independent of original AR size. */
+      dummyBytes = ((size_t)staticBytes / typeSize) * typeSize;
+    } else {
+      /* Factor mode: dummy proportional to original AR. */
+      dummyBytes = count * (size_t)(factor - 1) * typeSize;
+    }
     if (dummyBytes > piiDummyBufBytes) {
       if (!piiDummyClampWarned.exchange(true))
         WARN("pii AR inflate: dummy %zu B > pre-allocated %zu B; clamping. "
              "Raise NCCL_AR_INFLATE_MAX_BYTES if needed.",
              dummyBytes, piiDummyBufBytes);
       dummyBytes = (piiDummyBufBytes / typeSize) * typeSize;
-      dummyCount = dummyBytes / typeSize;
     }
+    size_t dummyCount = dummyBytes / typeSize;
     if (dummyCount == 0) break;
 
     struct ncclInfo dummyInfo = { ncclFuncAllReduce, "AllReduce",
