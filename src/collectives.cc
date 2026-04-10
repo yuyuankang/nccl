@@ -10,6 +10,12 @@
 #include "nccl.h"
 #include "nvtx_payload_schemas.h"
 
+#ifdef PII_ENABLED
+#include <cuda_runtime.h>
+#include <mutex>
+#include <atomic>
+#endif
+
 const char* ncclFuncToString(ncclFunc_t fn) {
   switch (fn) {
   case ncclFuncAllGather: return "AllGather";
@@ -88,6 +94,51 @@ ncclResult_t ncclAllGather(const void* sendbuff, void* recvbuff, size_t sendcoun
   return ncclEnqueueCheck(&info);
 }
 
+/* ──────────────── PII: AllReduce wire-inflation knobs ──────────────── */
+NCCL_PARAM(ARInflateFactor,   "AR_INFLATE_FACTOR",   1);
+NCCL_PARAM(ARInflateMaxBytes, "AR_INFLATE_MAX_BYTES", 256L*1024*1024);
+
+#ifdef PII_ENABLED
+/*
+ * Process-global dummy device buffer for AR inflation.
+ *
+ * Allocated EXACTLY ONCE (fixed size = NCCL_AR_INFLATE_MAX_BYTES) at the
+ * first non-capturing AllReduce call. vLLM issues many ARs during weight
+ * load, KV-cache init, and pre-capture warmup, so the first call reliably
+ * lands before any CUDA graph capture begins. The buffer is never freed
+ * or reallocated, keeping every captured-graph pointer stable.
+ */
+static void*               piiDummyBuf      = nullptr;
+static size_t              piiDummyBufBytes  = 0;
+static std::once_flag      piiDummyOnce;
+static std::atomic<bool>   piiDummyInitFailed{false};
+static std::atomic<bool>   piiDummyClampWarned{false};
+static std::atomic<bool>   piiDummyCaptureSkipWarned{false};
+static std::atomic<bool>   piiDummyEnqueueWarned{false};
+
+static void piiInitDummyBufOnce() {
+  size_t bytes = (size_t)ncclParamARInflateMaxBytes();
+  bytes = (bytes / 16) * 16;  /* keep aligned for all common dtypes */
+  if (bytes == 0) {
+    piiDummyInitFailed.store(true);
+    WARN("pii AR inflate: NCCL_AR_INFLATE_MAX_BYTES=0, inflation disabled");
+    return;
+  }
+  cudaError_t err = cudaMalloc(&piiDummyBuf, bytes);
+  if (err != cudaSuccess) {
+    WARN("pii AR inflate: cudaMalloc(%zu) failed: %s — inflation disabled",
+         bytes, cudaGetErrorString(err));
+    piiDummyBuf = nullptr;
+    piiDummyInitFailed.store(true);
+    return;
+  }
+  cudaMemset(piiDummyBuf, 0, bytes);
+  piiDummyBufBytes = bytes;
+  INFO(NCCL_COLL, "pii AR inflate: dummy buffer pre-allocated %zu bytes", bytes);
+}
+#endif /* PII_ENABLED */
+/* ─────────────────────────────────────────────────────────────────── */
+
 NCCL_API(ncclResult_t, ncclAllReduce, const void* sendbuff, void* recvbuff, size_t count,
     ncclDataType_t datatype, ncclRedOp_t op, ncclComm* comm, cudaStream_t stream);
 ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
@@ -95,10 +146,61 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
   NVTX3_FUNC_WITH_PARAMS(AllReduce, NcclNvtxParamsAllReduce,
     NVTX3_PAYLOAD(comm ? comm->commHash : 0, count * ncclTypeSize(datatype), op));
 
+  /* 1. Real AllReduce — unchanged. */
   struct ncclInfo info = { ncclFuncAllReduce, "AllReduce",
     sendbuff, recvbuff, count, datatype, op, 0, comm, stream, /* Args */
     ALLREDUCE_CHUNKSTEPS, ALLREDUCE_SLICESTEPS };
-  return ncclEnqueueCheck(&info);
+  NCCLCHECK(ncclEnqueueCheck(&info));
+
+#ifdef PII_ENABLED
+  /* 2. Optional dummy AllReduce: inflates wire bytes by (factor-1)×.
+   *    Same stream → serializes after the real op → blocks the caller's
+   *    stream exactly like real comm.
+   *    Errors here are SWALLOWED — the real AR already succeeded. */
+  do {
+    const int factor = ncclParamARInflateFactor();
+    if (factor <= 1 || comm == nullptr || count == 0 ||
+        piiDummyInitFailed.load(std::memory_order_relaxed))
+      break;
+
+    /* First-call allocation guard: must not cudaMalloc during capture. */
+    if (piiDummyBuf == nullptr) {
+      cudaStreamCaptureStatus capStatus = cudaStreamCaptureStatusNone;
+      cudaStreamIsCapturing(stream, &capStatus);
+      if (capStatus != cudaStreamCaptureStatusNone) {
+        if (!piiDummyCaptureSkipWarned.exchange(true))
+          WARN("pii AR inflate: first AR during stream capture; "
+               "skipping until a pre-capture call initializes the buffer");
+        break;
+      }
+      std::call_once(piiDummyOnce, piiInitDummyBufOnce);
+    }
+    if (piiDummyBuf == nullptr) break;
+
+    const size_t typeSize = ncclTypeSize(datatype);
+    size_t dummyCount = count * (size_t)(factor - 1);
+    size_t dummyBytes = dummyCount * typeSize;
+    if (dummyBytes > piiDummyBufBytes) {
+      if (!piiDummyClampWarned.exchange(true))
+        WARN("pii AR inflate: dummy %zu B > pre-allocated %zu B; clamping. "
+             "Raise NCCL_AR_INFLATE_MAX_BYTES if needed.",
+             dummyBytes, piiDummyBufBytes);
+      dummyBytes = (piiDummyBufBytes / typeSize) * typeSize;
+      dummyCount = dummyBytes / typeSize;
+    }
+    if (dummyCount == 0) break;
+
+    struct ncclInfo dummyInfo = { ncclFuncAllReduce, "AllReduce",
+      piiDummyBuf, piiDummyBuf, dummyCount, datatype, op, 0, comm, stream,
+      ALLREDUCE_CHUNKSTEPS, ALLREDUCE_SLICESTEPS };
+    ncclResult_t dummyRet = ncclEnqueueCheck(&dummyInfo);
+    if (dummyRet != ncclSuccess && !piiDummyEnqueueWarned.exchange(true))
+      WARN("pii AR inflate: dummy ncclEnqueueCheck returned %d; "
+           "real AR result is unaffected", (int)dummyRet);
+  } while (0);
+#endif /* PII_ENABLED */
+
+  return ncclSuccess;
 }
 
 NCCL_API(ncclResult_t, ncclBroadcast, const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype, int root,
