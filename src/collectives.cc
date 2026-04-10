@@ -111,11 +111,16 @@ NCCL_PARAM(ARInflateMaxBytes, "AR_INFLATE_MAX_BYTES", 256L*1024*1024);
  */
 static void*               piiDummyBuf      = nullptr;
 static size_t              piiDummyBufBytes  = 0;
+static void*               piiDummyRegHandle = nullptr;  /* ncclCommRegister handle */
+static ncclComm*           piiDummyRegComm   = nullptr;  /* comm used for registration */
 static std::once_flag      piiDummyOnce;
 static std::atomic<bool>   piiDummyInitFailed{false};
 static std::atomic<bool>   piiDummyClampWarned{false};
 static std::atomic<bool>   piiDummyCaptureSkipWarned{false};
 static std::atomic<bool>   piiDummyEnqueueWarned{false};
+
+/* Forward declaration — defined in register/register.cc */
+extern ncclResult_t ncclRegister(struct ncclComm* comm, void* data, size_t size, bool isGraph, void** handle);
 
 static void piiInitDummyBufOnce() {
   size_t bytes = (size_t)ncclParamARInflateMaxBytes();
@@ -137,6 +142,21 @@ static void piiInitDummyBufOnce() {
   piiDummyBufBytes = bytes;
   INFO(NCCL_COLL, "pii AR inflate: dummy buffer pre-allocated %zu bytes", bytes);
 }
+
+/* Register piiDummyBuf with the NCCL comm so it uses GDRDMA (not bounce
+   buffers). Must be called after piiInitDummyBufOnce and outside graph
+   capture. Safe to call multiple times — only registers once. */
+static void piiRegisterDummyBuf(ncclComm* comm) {
+  if (piiDummyRegHandle != nullptr || piiDummyBuf == nullptr) return;
+  ncclResult_t ret = ncclRegister(comm, piiDummyBuf, piiDummyBufBytes, false, &piiDummyRegHandle);
+  if (ret == ncclSuccess) {
+    piiDummyRegComm = comm;
+    INFO(NCCL_COLL, "pii AR inflate: registered dummy buffer for GDRDMA (%zu bytes)", piiDummyBufBytes);
+  } else {
+    WARN("pii AR inflate: ncclRegister failed (%d), will use bounce buffers", (int)ret);
+    piiDummyRegHandle = nullptr;
+  }
+}
 #endif /* PII_ENABLED */
 /* ─────────────────────────────────────────────────────────────────── */
 
@@ -154,19 +174,12 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
   NCCLCHECK(ncclEnqueueCheck(&info));
 
 #ifdef PII_ENABLED
-  /* 2. Optional dummy traffic via ncclSend/ncclRecv on the REAL recvbuff.
+  /* 2. Optional dummy AllReduce on a REGISTERED buffer.
    *
-   *    Uses the already-registered recvbuff (GDRDMA path) so that:
-   *      - NIC reads FROM GPU memory (GPU M2PCIe outbound, NCS)
-   *      - NIC writes TO GPU memory (GPU M2PCIe inbound, NCB)
-   *    This ensures the dummy traffic goes through the SAME PCIe path
-   *    as the real AllReduce, and competes with SSD→GPU (gio) at the
-   *    GPU's M2PCIe — unlike the old approach which used an unregistered
-   *    piiDummyBuf that fell back to host-memory bounce buffers.
-   *
-   *    After AllReduce, both ranks hold identical data in recvbuff.
-   *    Exchanging via send/recv overwrites recvbuff with the peer's
-   *    copy, which is the same value. Result is bit-identical.
+   *    The dummy buffer (piiDummyBuf) is registered with ncclCommRegister
+   *    so NCCL uses the GDRDMA path (NIC reads/writes directly from/to
+   *    GPU memory). Without registration, NCCL falls back to host-memory
+   *    bounce buffers and the dummy traffic bypasses the GPU M2PCIe.
    *
    *    Two modes:
    *      Static: NCCL_AR_INFLATE_BYTES=N  → send N bytes per AR call
@@ -177,66 +190,51 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
     const int64_t staticBytes = ncclParamARInflateBytes();
     const int factor = ncclParamARInflateFactor();
     if (comm == nullptr || count == 0 ||
-        (staticBytes <= 0 && factor <= 1))
+        (staticBytes <= 0 && factor <= 1) ||
+        piiDummyInitFailed.load(std::memory_order_relaxed))
       break;
 
-    const size_t typeSize = ncclTypeSize(datatype);
-    const size_t realBytes = count * typeSize;
-    size_t targetBytes;
-    if (staticBytes > 0) {
-      targetBytes = (size_t)staticBytes;
-    } else {
-      targetBytes = realBytes * (size_t)(factor - 1);
-    }
-    if (targetBytes == 0) break;
-
-    /* Peer rank for TP=2. For nRanks>2 this sends to the next rank in
-       the ring and receives from the previous. */
-    const int sendPeer = (comm->rank + 1) % comm->nRanks;
-    const int recvPeer = (comm->rank + comm->nRanks - 1) % comm->nRanks;
-
-    /* Send in chunks of up to realBytes (the registered buffer size).
-       Each iteration does one grouped send+recv of min(remaining, realBytes).
-       Uses the public ncclSend/ncclRecv API inside ncclGroupStart/End so
-       NCCL treats both as a single fused operation. */
-    size_t sent = 0;
-    while (sent < targetBytes) {
-      size_t chunkBytes = targetBytes - sent;
-      if (chunkBytes > realBytes) chunkBytes = realBytes;
-      size_t chunkCount = chunkBytes / typeSize;
-      if (chunkCount == 0) break;
-
-      ncclResult_t ret;
-
-      /* Group the send+recv so they form a single NCCL kernel launch. */
-      ncclGroupStartInternal();
-
-      /* Send from recvbuff (registered for GDRDMA). */
-      struct ncclInfo sendInfo = { ncclFuncSend, "Send",
-        NULL, recvbuff, chunkCount, datatype, ncclSum, sendPeer, comm, stream, 1, 1 };
-      ret = ncclEnqueueCheck(&sendInfo);
-
-      /* Recv into recvbuff (registered for GDRDMA). Overwrites with
-         identical data from peer — result is bit-identical. */
-      if (ret == ncclSuccess) {
-        struct ncclInfo recvInfo = { ncclFuncRecv, "Recv",
-          NULL, recvbuff, chunkCount, datatype, ncclSum, recvPeer, comm, stream, 1, 1 };
-        ret = ncclEnqueueCheck(&recvInfo);
-      }
-
-      /* ncclGroupEndInternal launches the grouped send+recv. Since
-         ncclEnqueueCheck already called ncclGroupStartInternal twice
-         (once per call), we need to match the depth back to 0.
-         The extra ncclGroupEndInternal below closes our outer group. */
-      ncclGroupEndInternal();
-
-      if (ret != ncclSuccess) {
-        if (!piiDummyEnqueueWarned.exchange(true))
-          WARN("pii AR inflate: send/recv returned %d; real AR unaffected", (int)ret);
+    /* First-call allocation guard: must not cudaMalloc during capture. */
+    if (piiDummyBuf == nullptr) {
+      cudaStreamCaptureStatus capStatus = cudaStreamCaptureStatusNone;
+      cudaStreamIsCapturing(stream, &capStatus);
+      if (capStatus != cudaStreamCaptureStatusNone) {
+        if (!piiDummyCaptureSkipWarned.exchange(true))
+          WARN("pii AR inflate: first AR during stream capture; "
+               "skipping until a pre-capture call initializes the buffer");
         break;
       }
-      sent += chunkBytes;
+      std::call_once(piiDummyOnce, piiInitDummyBufOnce);
+      /* Register for GDRDMA immediately after allocation. */
+      if (piiDummyBuf != nullptr)
+        piiRegisterDummyBuf(comm);
     }
+    if (piiDummyBuf == nullptr) break;
+
+    const size_t typeSize = ncclTypeSize(datatype);
+    size_t dummyBytes;
+    if (staticBytes > 0) {
+      dummyBytes = ((size_t)staticBytes / typeSize) * typeSize;
+    } else {
+      dummyBytes = count * (size_t)(factor - 1) * typeSize;
+    }
+    if (dummyBytes > piiDummyBufBytes) {
+      if (!piiDummyClampWarned.exchange(true))
+        WARN("pii AR inflate: dummy %zu B > pre-allocated %zu B; clamping. "
+             "Raise NCCL_AR_INFLATE_MAX_BYTES if needed.",
+             dummyBytes, piiDummyBufBytes);
+      dummyBytes = (piiDummyBufBytes / typeSize) * typeSize;
+    }
+    size_t dummyCount = dummyBytes / typeSize;
+    if (dummyCount == 0) break;
+
+    struct ncclInfo dummyInfo = { ncclFuncAllReduce, "AllReduce",
+      piiDummyBuf, piiDummyBuf, dummyCount, datatype, op, 0, comm, stream,
+      ALLREDUCE_CHUNKSTEPS, ALLREDUCE_SLICESTEPS };
+    ncclResult_t dummyRet = ncclEnqueueCheck(&dummyInfo);
+    if (dummyRet != ncclSuccess && !piiDummyEnqueueWarned.exchange(true))
+      WARN("pii AR inflate: dummy ncclEnqueueCheck returned %d; "
+           "real AR result is unaffected", (int)dummyRet);
   } while (0);
 #endif /* PII_ENABLED */
 
