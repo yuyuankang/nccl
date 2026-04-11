@@ -27,6 +27,10 @@
 #include "ibvwrap.h"
 #include "mlx5/mlx5dvwrap.h"
 
+#ifdef PII_ENABLED
+#include <atomic>
+#endif
+
 #define MAXSUFFIXSIZE 16
 #define MAXNAMESIZE (64 + MAXSUFFIXSIZE)
 static char ncclIbIfName[MAX_IF_NAME_SIZE+1];
@@ -1166,7 +1170,15 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base, 
   qpInitAttr.recv_cq = base->cq;
   qpInitAttr.qp_type = IBV_QPT_RC;
   // We might send 2 messages per send (RDMA and RDMA_WITH_IMM)
+#ifdef PII_ENABLED
+  /* PII WR-level inflation may post up to PII_IB_WR_INFLATE_MAX extra
+     unsignaled WRs per real WR before the signaled trigger. Size the
+     send queue to accommodate the worst case. ConnectX devices easily
+     support tens of thousands of send_wr per QP. */
+  qpInitAttr.cap.max_send_wr = 2*MAX_REQUESTS*PII_IB_WR_INFLATE_MAX;
+#else
   qpInitAttr.cap.max_send_wr = 2*MAX_REQUESTS;
+#endif
   qpInitAttr.cap.max_recv_wr = MAX_REQUESTS;
   qpInitAttr.cap.max_send_sge = 1;
   qpInitAttr.cap.max_recv_sge = 1;
@@ -1975,6 +1987,37 @@ ncclResult_t ncclIbDeregMr(void* comm, void* mhandle) {
 
 NCCL_PARAM(IbSplitDataOnQps, "IB_SPLIT_DATA_ON_QPS", 0);
 
+#ifdef PII_ENABLED
+/* ───────────── PII: WR-level wire-inflation knob ─────────────
+ * NCCL_IB_WR_INFLATE_FACTOR (default 1, max 32)
+ *
+ * For every real RDMA_WRITE chain that ncclIbMultiSend posts to a QP,
+ * post (factor-1) extra UNSIGNALED copies of the same data WRs to the
+ * same remote address first. The QP processes them FIFO, so the real
+ * signaled RDMA_WRITE_WITH_IMM at the end of the chain only completes
+ * once all (factor-1) extra wire transfers have drained. The receiver
+ * sees no spurious arrivals (extras are plain RDMA_WRITE — no IMM, no
+ * recv-CQE), and the destination memory ends up with the same bytes
+ * (the real WR overwrites whatever the extras wrote).
+ *
+ * Cost model:
+ *   per-call latency  = (factor) × wire_time(real_chain_bytes) + ε
+ *   per-call wire BW  = factor × real_bytes / unit_time
+ *   per-call SW ovhd  = ~constant (1 extra ibv_post_send per inflation,
+ *                       no kernel launch, no proxy notification, no AR
+ *                       enqueue, no extra completion polling)
+ *
+ * Compare to NCCL_AR_INFLATE_FACTOR (collective-level): that path enqueues
+ * a second AllReduce, paying full per-AR overhead (kernel launch, proxy
+ * progress, completion stream-sync) per dummy. This WR-level path adds
+ * pure transmission time only — making the AllReduce link-bound rather
+ * than software-bound, so it can actually be contended by gio SSD→GPU
+ * traffic at the GPU PCIe inbound segment.
+ */
+NCCL_PARAM(IbWrInflateFactor, "IB_WR_INFLATE_FACTOR", 1);
+#define PII_IB_WR_INFLATE_MAX 32
+#endif
+
 ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
   struct ncclIbRequest** reqs = comm->fifoReqs[slot];
   volatile struct ncclIbSendFifo* slots = comm->fifo[slot];
@@ -2085,6 +2128,68 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
       reqs[r]->pInfo[0].nEventHandles++;
     }
 #endif
+
+#ifdef PII_ENABLED
+    /* PII WR-level inflation: post (factor-1) unsignaled copies of the
+       data WRs to the QP before the real (signaled) post. The QP's send
+       queue is FIFO, so the real RDMA_WRITE_WITH_IMM at the end of the
+       real chain will not complete until all extras have drained the
+       wire. This adds pure wire time without paying any per-AR or
+       per-message NCCL software overhead. Errors are best-effort: if
+       the QP rejects an extra (e.g. ENOMEM), we drop the rest and let
+       the real post proceed. */
+    {
+      int piiWrInflateFactor = (int)ncclParamIbWrInflateFactor();
+      if (piiWrInflateFactor < 1) piiWrInflateFactor = 1;
+      if (piiWrInflateFactor > PII_IB_WR_INFLATE_MAX) piiWrInflateFactor = PII_IB_WR_INFLATE_MAX;
+      if (piiWrInflateFactor > 1 && nreqs > 0) {
+        struct ibv_send_wr piiExtraWrs[NCCL_NET_IB_MAX_RECVS];
+        struct ibv_sge    piiExtraSges[NCCL_NET_IB_MAX_RECVS];
+        bool piiAnyData = false;
+        for (int r = 0; r < nreqs; r++) {
+          /* Clone the real data WR (wrs[r]). The real wrs[r] is always
+             a plain RDMA_WRITE (not WITH_IMM) and is unsignaled in the
+             multi-recv / AR cases; in the single-req-without-AR case
+             wrs[0] IS the lastWr (RDMA_WRITE_WITH_IMM, signaled). For
+             extras we always force opcode=RDMA_WRITE and send_flags=0
+             so the receiver gets no spurious recv-CQE and the sender
+             gets no extra send-CQE. */
+          piiExtraWrs[r] = comm->wrs[r];
+          piiExtraWrs[r].opcode     = IBV_WR_RDMA_WRITE;
+          piiExtraWrs[r].send_flags = 0;
+          piiExtraWrs[r].imm_data   = 0;
+          piiExtraWrs[r].wr_id      = 0;  /* unused — unsignaled */
+          if (comm->wrs[r].num_sge > 0 && comm->wrs[r].sg_list != NULL) {
+            piiExtraSges[r] = comm->sges[r];
+            piiExtraWrs[r].sg_list = &piiExtraSges[r];
+            piiExtraWrs[r].num_sge = 1;
+            if (piiExtraSges[r].length > 0) piiAnyData = true;
+          } else {
+            piiExtraWrs[r].sg_list = NULL;
+            piiExtraWrs[r].num_sge = 0;
+          }
+          piiExtraWrs[r].next = (r + 1 < nreqs) ? &piiExtraWrs[r + 1] : NULL;
+        }
+        /* Skip the post entirely if all sges are empty (e.g. all chunks
+           already drained on a prior nqps iteration) — would just be
+           empty WRs adding no wire bytes. */
+        if (piiAnyData) {
+          for (int k = 0; k < piiWrInflateFactor - 1; k++) {
+            struct ibv_send_wr* pii_bad_wr = NULL;
+            ncclResult_t piiRet = wrap_ibv_post_send(qp->qp, piiExtraWrs, &pii_bad_wr);
+            if (piiRet != ncclSuccess) {
+              static std::atomic<bool> warned{false};
+              if (!warned.exchange(true))
+                WARN("pii WR inflate: extra post_send failed at iter %d/%d "
+                     "(qp=%p), real send proceeds", k, piiWrInflateFactor - 1, qp->qp);
+              break;
+            }
+          }
+        }
+      }
+    }
+#endif
+
     NCCLCHECK(wrap_ibv_post_send(qp->qp, comm->wrs, &bad_wr));
 
     for (int r=0; r<nreqs; r++) {
