@@ -30,8 +30,12 @@
 #ifdef PII_ENABLED
 #include <atomic>
 /* Cap on the WR-level wire inflation factor (NCCL_IB_WR_INFLATE_FACTOR).
- * Must be defined before ncclIbCreateQp because it sizes the QP send queue. */
-#define PII_IB_WR_INFLATE_MAX 32
+ * Must be defined before ncclIbCreateQp because it sizes the QP send queue.
+ * Bumping max_send_wr too aggressively causes ibv_create_qp to return
+ * EINVAL on ConnectX-7 (the per-QP send-WR cap interacts with CQ depth and
+ * resource domains). 8 → max_send_wr = 2*MAX_REQUESTS*8 = 4096, comfortably
+ * below the device limit while still supporting up to factor=8. */
+#define PII_IB_WR_INFLATE_MAX 8
 #endif
 
 #define MAXSUFFIXSIZE 16
