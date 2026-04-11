@@ -29,6 +29,9 @@
 
 #ifdef PII_ENABLED
 #include <atomic>
+/* Cap on the WR-level wire inflation factor (NCCL_IB_WR_INFLATE_FACTOR).
+ * Must be defined before ncclIbCreateQp because it sizes the QP send queue. */
+#define PII_IB_WR_INFLATE_MAX 32
 #endif
 
 #define MAXSUFFIXSIZE 16
@@ -2015,7 +2018,6 @@ NCCL_PARAM(IbSplitDataOnQps, "IB_SPLIT_DATA_ON_QPS", 0);
  * traffic at the GPU PCIe inbound segment.
  */
 NCCL_PARAM(IbWrInflateFactor, "IB_WR_INFLATE_FACTOR", 1);
-#define PII_IB_WR_INFLATE_MAX 32
 #endif
 
 ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
