@@ -47,11 +47,15 @@ struct PiiThreadSession {
     const char* nic_bdf = getenv("PII_NIC_BDF");
     if (!gpu_bdf) gpu_bdf = "99:00.0";
     if (!nic_bdf) nic_bdf = "ab:00.0";
-    session = create_session(sock, gpu_bdf, nic_bdf);
+    /* GPU_NIC (GPUDirect RDMA send out of GPU HBM via NIC) is high-priority
+     * traffic — it's the NCCL AllReduce bytes that the PII case study is
+     * protecting. The daemon's flow controller must never throttle it:
+     * budget stays at -1 regardless of NIC-side congestion. */
+    session = create_session(sock, gpu_bdf, nic_bdf, PII_PRIO_HIGH);
     if (session)
-      INFO(NCCL_NET, "pii: thread session ready (GPU=%s NIC=%s)", gpu_bdf, nic_bdf);
+      INFO(NCCL_NET, "pii: thread session ready (GPU=%s NIC=%s prio=HIGH)", gpu_bdf, nic_bdf);
     else
-      WARN("pii: create_session failed (GPU=%s NIC=%s)", gpu_bdf, nic_bdf);
+      WARN("pii: create_session failed (GPU=%s NIC=%s prio=HIGH)", gpu_bdf, nic_bdf);
   }
 
   ~PiiThreadSession() {
